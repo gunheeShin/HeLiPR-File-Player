@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <ros/ros.h>
 #include <ros/time.h>
+#include <filesystem>
 #include <opencv2/opencv.hpp>
 #include <opencv2/core/core.hpp>
 #include <opencv2/highgui/highgui.hpp>
@@ -148,10 +149,26 @@ struct Point3D {
   }
 };
 
+struct SavePointStruct{
+    float x;
+    float y;
+    float z;
+    float intensity;
+    uint32_t time;
+} EIGEN_ALIGN16;
+POINT_CLOUD_REGISTER_POINT_STRUCT(SavePointStruct,
+                                  (float, x, x)
+                                  (float, y, y)
+                                  (float, z, z)
+                                  (float, intensity, intensity)
+                                  (uint32_t, time, time)  
+)
+
 using pc_type = PointXYZIRT;
 using pc_type_o = OusterPointXYZIRT;
 using pc_type_l = LivoxPointXYZI;
 using pc_type_a = AevaPointXYZIRT;
+using pc_type_s = SavePointStruct;
 
 class ROSThread : public QThread
 {
@@ -201,6 +218,8 @@ public:
     string data_folder_path_;
 
     int imu_data_version_;
+
+    std::string custom_cloud_dir_;
 
     void Ready();
     void ResetProcessStamp(int position);

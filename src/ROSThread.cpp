@@ -253,6 +253,18 @@ void ROSThread::Ready()
   velodyne_thread_.thread_ = std::thread(&ROSThread::VelodyneThread,this);
   avia_thread_.thread_ = std::thread(&ROSThread::AviaThread,this);
   aeva_thread_.thread_ = std::thread(&ROSThread::AevaThread,this);
+
+  custom_cloud_dir_ = data_folder_path_ + "/LiDARs";
+  if(boost::filesystem::exists(custom_cloud_dir_)){
+    boost::filesystem::remove_all(custom_cloud_dir_);
+  }
+  boost::filesystem::create_directory(custom_cloud_dir_);
+
+  boost::filesystem::create_directory(custom_cloud_dir_ + "/Ouster");
+  boost::filesystem::create_directory(custom_cloud_dir_ + "/Velodyne");
+  boost::filesystem::create_directory(custom_cloud_dir_ + "/Avia");
+  boost::filesystem::create_directory(custom_cloud_dir_ + "/Aeva");
+
 }
 
 void ROSThread::DataStampThread()
@@ -410,6 +422,23 @@ void ROSThread::TimerCallback(const ros::TimerEvent&)
 //ouster
 void ROSThread::OusterThread()
 {
+  auto save_custom_cloud = [&](int64_t stamp, pcl::PointCloud<pc_type_o> cloud){
+    string custom_cloud_file = custom_cloud_dir_ + "/Ouster" + "/" + to_string(stamp) + ".pcd";
+    // save custom point
+
+    pcl::PointCloud<pc_type_s> custom_cloud;
+    custom_cloud.clear();
+    for(auto point : cloud.points){
+      pc_type_s custom_point;
+      custom_point.x = point.x;
+      custom_point.y = point.y;
+      custom_point.z = point.z;
+      custom_point.intensity = point.intensity;
+      custom_point.time = point.t;
+      custom_cloud.points.push_back(custom_point);
+    }
+    pcl::io::savePCDFileBinary(custom_cloud_file, custom_cloud);
+  };
   int current_file_index = 0;
   int previous_file_index = 0;
   while(1){
@@ -459,6 +488,8 @@ void ROSThread::OusterThread()
             publish_cloud.header.stamp.fromNSec(data);
             publish_cloud.header.frame_id = "ouster";
             ouster_pub_.publish(publish_cloud);
+
+            save_custom_cloud(data, cloud);
         }
         previous_file_index = 0;
       }
@@ -489,6 +520,11 @@ void ROSThread::OusterThread()
           pcl::toROSMsg(cloud, publish_cloud);
 
           ouster_next_ = make_pair(ouster_file_list_[current_file_index+1], publish_cloud);
+
+          std::string next_stamp_str = ouster_file_list_[current_file_index+1].substr(0,ouster_file_list_[current_file_index+1].find(".bin"));
+          int64_t next_stamp = std::stoll(next_stamp_str);
+          save_custom_cloud(next_stamp, cloud);
+
       }
 
       previous_file_index = current_file_index;
@@ -499,6 +535,71 @@ void ROSThread::OusterThread()
 
 void ROSThread::VelodyneThread()
 {
+  auto save_custom_cloud = [&](int64_t stamp, pcl::PointCloud<pc_type> cloud){
+    string custom_cloud_file = custom_cloud_dir_ + "/Velodyne" + "/" + to_string(stamp) + ".pcd";
+    pcl::PointCloud<pc_type_s> custom_cloud;
+    custom_cloud.clear();
+
+    double omega_l = 361 * 10;       // scan angular velocity (deg/s)
+    std::vector<bool> is_first(16,true);
+    std::vector<double> yaw_fp(16, 0.0);      // yaw of first scan point
+    std::vector<float> yaw_last(16, 0.0);   // yaw of last scan point
+    std::vector<float> time_last(16, 0.0);   // time of last scan point
+
+    int pt_size = cloud.points.size();
+    double yaw_first = atan2(cloud.points[0].y, cloud.points[0].x) * 57.29578;
+    double yaw_end = yaw_first;
+    int layer_first = cloud.points[0].ring;
+    for(int i = pt_size - 1; i > 0; i--){
+        if(cloud.points[i].ring == layer_first){
+            yaw_end = atan2(cloud.points[i].y, cloud.points[i].x) * 57.29578;
+            break;
+        }
+    }
+
+    for(auto point : cloud.points){
+      pc_type_s custom_point;
+      custom_point.x = point.x;
+      custom_point.y = point.y;
+      custom_point.z = point.z;
+      custom_point.intensity = point.intensity;
+
+      int layer = point.ring;
+        double yaw_angle = atan2(point.y, point.x) * 57.29578;
+        if(is_first[layer]){
+            yaw_fp[layer] = yaw_angle;
+            is_first[layer] = false;
+            custom_point.time = 0;
+            time_last[layer] = 0;
+            yaw_last[layer] = yaw_angle;
+            custom_cloud.points.push_back(custom_point);
+            continue;
+        }
+
+        double point_time;
+        if(yaw_angle <= yaw_fp[layer]){
+            point_time = (yaw_fp[layer] - yaw_angle) / omega_l;
+        }else{
+            // point_time = (yaw_angle + 360 - yaw_last[layer]) / omega_l;
+            point_time = (yaw_fp[layer] + 360 - yaw_angle) / omega_l;
+        }
+
+        if(point_time < time_last[layer]){
+            point_time = point_time + 360 / omega_l;
+        }
+
+        yaw_last[layer] = yaw_angle;
+        time_last[layer] = point_time;
+        point_time = point_time - static_cast<int>(point_time);
+
+        custom_point.time = static_cast<uint32_t>(point_time  * 1e9);
+
+        custom_cloud.points.push_back(custom_point);
+    }
+
+    pcl::io::savePCDFileBinary(custom_cloud_file, custom_cloud);
+  };
+
   int current_file_index = 0;
   int previous_file_index = 0;
   while(1){
@@ -551,6 +652,8 @@ void ROSThread::VelodyneThread()
             publish_cloud.header.frame_id = "velodyne";
             velodyne_pub_.publish(publish_cloud);
 
+            save_custom_cloud(data, cloud);
+
         }
         previous_file_index = 0;
       }
@@ -579,6 +682,10 @@ void ROSThread::VelodyneThread()
           file.close();
           pcl::toROSMsg(cloud, publish_cloud);
           velodyne_next_ = make_pair(velodyne_file_list_[current_file_index+1], publish_cloud);
+
+          std::string next_stamp_str = velodyne_file_list_[current_file_index+1].substr(0,velodyne_file_list_[current_file_index+1].find(".bin"));
+          int64_t next_stamp = std::stoll(next_stamp_str);
+          save_custom_cloud(next_stamp, cloud);
       }
 
       previous_file_index = current_file_index;
@@ -589,6 +696,22 @@ void ROSThread::VelodyneThread()
 
 void ROSThread::AevaThread()
 {
+  auto save_custom_cloud = [&](int64_t stamp, pcl::PointCloud<pc_type_a> cloud){
+    string custom_cloud_file = custom_cloud_dir_ + "/Aeva" + "/" + to_string(stamp) + ".pcd";
+    pcl::PointCloud<pc_type_s> custom_cloud;
+    custom_cloud.clear();
+    for(auto point : cloud.points){
+      pc_type_s custom_point;
+      custom_point.x = point.x;
+      custom_point.y = point.y;
+      custom_point.z = point.z;
+      custom_point.intensity = point.intensity;
+      custom_point.time = point.time_offset_ns;
+      custom_cloud.points.push_back(custom_point);
+    }
+    pcl::io::savePCDFileBinary(custom_cloud_file, custom_cloud);
+  };
+
   int current_file_index = 0;
   int previous_file_index = 0;
   while(1){
@@ -640,6 +763,7 @@ std::cout.precision(20);
             publish_cloud.header.frame_id = "aeva";          
             aeva_pub_.publish(publish_cloud);
 
+            save_custom_cloud(data, cloud);
         }
         previous_file_index = 0;
       }
@@ -670,6 +794,10 @@ std::cout.precision(20);
           file.close();
           pcl::toROSMsg(cloud, publish_cloud);
           aeva_next_ = make_pair(aeva_file_list_[current_file_index+1], publish_cloud);
+
+          std::string next_stamp_str = aeva_file_list_[current_file_index+1].substr(0,aeva_file_list_[current_file_index+1].find(".bin"));
+          int64_t next_stamp = std::stoll(next_stamp_str);
+          save_custom_cloud(next_stamp, cloud);
       }
 
       previous_file_index = current_file_index;
@@ -680,6 +808,22 @@ std::cout.precision(20);
 
 void ROSThread::AviaThread()
 {
+  auto save_custom_cloud = [&](int64_t stamp, livox_ros_driver::CustomMsg cloud){
+    string custom_cloud_file = custom_cloud_dir_ + "/Avia" + "/" + to_string(stamp) + ".pcd";
+    pcl::PointCloud<pc_type_s> custom_cloud;
+    custom_cloud.clear();
+    for(auto point : cloud.points){
+      pc_type_s custom_point;
+      custom_point.x = point.x;
+      custom_point.y = point.y;
+      custom_point.z = point.z;
+      custom_point.intensity = point.reflectivity;
+      custom_point.time = point.offset_time;
+      custom_cloud.points.push_back(custom_point);
+    }
+    pcl::io::savePCDFileBinary(custom_cloud_file, custom_cloud);
+  };
+
   int current_file_index = 0;
   int previous_file_index = 0;
   while(1){
@@ -731,6 +875,7 @@ void ROSThread::AviaThread()
             avia_msg.header.frame_id = "livox_avia";
             avia_pub_.publish(avia_msg);
 
+            save_custom_cloud(data, avia_msg);
         }
         previous_file_index = 0;
       }
@@ -760,6 +905,11 @@ void ROSThread::AviaThread()
           avia_msg.header.stamp.fromNSec(data);
           avia_msg.header.frame_id = "livox_avia";
           avia_next_ = make_pair(avia_file_list_[current_file_index+1], avia_msg);
+
+          std::string next_stamp_str = avia_file_list_[current_file_index+1].substr(0,avia_file_list_[current_file_index+1].find(".bin"));
+          int64_t next_stamp = std::stoll(next_stamp_str);
+          save_custom_cloud(next_stamp, avia_msg);
+        
       }
 
       previous_file_index = current_file_index;
